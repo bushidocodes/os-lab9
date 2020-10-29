@@ -5,82 +5,130 @@
 
 // Memory allocator by Kernighan and Ritchie,
 // The C programming Language, 2nd ed.  Section 8.7.
+// Refactored to make variables and algorithm more clear
 
-typedef long Align;
-
-union header {
-	struct {
-		union header *ptr;
-		uint          size;
-	} s;
-	Align x;
+struct header {
+	uint size;
 };
 
-typedef union header Header;
+struct freelist_node {
+	struct freelist_node *next;
+	struct header         hdr;
+};
 
-static Header  base;
-static Header *freep;
+/* Base static node of size 0 used as degenerate freelist */
+static struct freelist_node base;
 
+/* A pointer that rotates around the freelist. It is set to previous node at the end of malloc or free */
+static struct freelist_node *freelist;
+
+/*
+ * Frees previously allocated memory, adding the resulting freenode to the freelist
+ * This is assumed to be a valid freenode allocated by malloc with a valid header preceeding the passed pointer
+ * @param ptr - the address of previously allocated memory we want to add to the freelist
+ */
 void
-free(void *ap)
+free(void *ptr)
 {
-	Header *bp, *p;
+	struct freelist_node *mem, *node;
 
-	bp = (Header *)ap - 1;
-	for (p = freep; !(bp > p && bp < p->s.ptr); p = p->s.ptr)
-		if (p >= p->s.ptr && (bp > p || bp < p->s.ptr)) break;
-	if (bp + bp->s.size == p->s.ptr) {
-		bp->s.size += p->s.ptr->s.size;
-		bp->s.ptr = p->s.ptr->s.ptr;
-	} else
-		bp->s.ptr = p->s.ptr;
-	if (p + p->s.size == bp) {
-		p->s.size += bp->s.size;
-		p->s.ptr = bp->s.ptr;
-	} else
-		p->s.ptr = bp;
-	freep = p;
+	mem = (struct freelist_node *)ptr - 1;
+
+	node = freelist;
+	while (!(mem > node && mem < node->next)) {
+		if (node >= node->next                   /* If we're about to wrap around */
+		    && (mem > node || mem < node->next)) /* And the freed memory is not between the first and last node,
+		                                            just break */
+			break;
+		node = node->next;
+	}
+
+	if (mem + mem->hdr.size == node->next) {
+		mem->hdr.size += node->next->hdr.size;
+		mem->next = node->next->next;
+	} else {
+		mem->next = node->next;
+	}
+
+	if (node + node->hdr.size == mem) {
+		node->hdr.size += mem->hdr.size;
+		node->next = mem->next;
+	} else {
+		node->next = mem;
+	}
+
+	freelist = node;
 }
 
-static Header *
+/**
+ * Expands the backing memory allocated to the freelist
+ * @param nu the number of "core" units to add to the freelist.
+ * This is an abstract unit equal to the size of a freelist_node struct.
+ * @returns address of the body of a newly allocated freelist node or 0 on error
+ **/
+static struct freelist_node *
 morecore(uint nu)
 {
-	char *  p;
-	Header *hp;
-
 	if (nu < 4096) nu = 4096;
-	p = sbrk(nu * sizeof(Header));
-	if (p == (char *)-1) return 0;
-	hp         = (Header *)p;
-	hp->s.size = nu;
-	free((void *)(hp + 1));
-	return freep;
+
+	char *ptr = sbrk(nu * sizeof(struct freelist_node));
+	if (ptr == (char *)-1) goto err;
+
+	struct freelist_node *node = (struct freelist_node *)ptr;
+	node->hdr.size             = nu;
+
+	free((void *)(node + 1));
+
+	return freelist;
+err:
+	return 0;
 }
 
+/**
+ * @param nbytes the number of bytes of allocate
+ * @returns address of allocated memory or 0 on error
+ **/
 void *
 malloc(uint nbytes)
 {
-	Header *p, *prevp;
-	uint    nunits;
+	struct freelist_node *node;
+	struct freelist_node *prev_node;
 
-	nunits = (nbytes + sizeof(Header) - 1) / sizeof(Header) + 1;
-	if ((prevp = freep) == 0) {
-		base.s.ptr = freep = prevp = &base;
-		base.s.size                = 0;
+	uint nunits = (nbytes + sizeof(struct freelist_node) - 1) / sizeof(struct freelist_node) + 1;
+
+	if (freelist == 0) {
+		base.next = freelist = prev_node = &base;
+		base.hdr.size                    = 0;
 	}
-	for (p = prevp->s.ptr;; prevp = p, p = p->s.ptr) {
-		if (p->s.size >= nunits) {
-			if (p->s.size == nunits)
-				prevp->s.ptr = p->s.ptr;
-			else {
-				p->s.size -= nunits;
-				p += p->s.size;
-				p->s.size = nunits;
-			}
-			freep = prevp;
-			return (void *)(p + 1);
+
+	node      = freelist->next;
+	prev_node = freelist;
+
+	while (1) {
+		if (node->hdr.size == nunits) {
+			prev_node->next = node->next;
+			goto done;
 		}
-		if (p == freep)
-			if ((p = morecore(nunits)) == 0) return 0;
+
+		if (node->hdr.size > nunits) {
+			node->hdr.size -= nunits;
+			node += node->hdr.size;
+			node->hdr.size = nunits;
+			goto done;
+		}
+
+		if (node == freelist) {
+			node = morecore(nunits);
+			if (node == 0) goto err_alloc;
+		}
+
+		prev_node = node;
+		node      = node->next;
 	}
+
+done:
+	freelist = prev_node;
+	return (void *)(node + 1);
+err_alloc:
+	return 0;
 }
